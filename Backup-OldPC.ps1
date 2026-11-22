@@ -153,6 +153,13 @@ function Get-SafeName([string]$Name) {
 }
 
 function Invoke-Robo([string]$Source, [string]$Dest, [string[]]$Extra = @()) {
+    # Always exclude the backup folder itself: if it sits inside the folder being copied
+    # (e.g. the kit was run from Downloads), robocopy would copy the backup into itself forever.
+    $Extra = @($Extra | Where-Object { $_ })
+    $xd = -1
+    for ($i = 0; $i -lt $Extra.Count; $i++) { if ($Extra[$i] -eq '/XD') { $xd = $i; break } }
+    if ($xd -ge 0) { $Extra = @($Extra[0..$xd]) + @($B) + @($Extra | Select-Object -Skip ($xd + 1)) }
+    else { $Extra += @('/XD', $B) }
     $roboArgs = @($Source, $Dest, '/E', '/R:1', '/W:1', '/XJ', '/MT:16', '/NP', '/NFL', '/NDL', "/LOG+:$Script:RoboLog") + $Extra
     & robocopy.exe @roboArgs | Out-Null
     return ($LASTEXITCODE -lt 8)
@@ -295,11 +302,12 @@ if (-not $OutputPath) { $OutputPath = $PSScriptRoot }
 if (-not $OutputPath) { $OutputPath = (Get-Location).Path }
 
 function Get-OtherDrives {
+    # Other writable drives, USB/removable first, most free space first.
     try {
-        Get-CimInstance Win32_LogicalDisk -ErrorAction Stop |
-            Where-Object { $_.DriveType -in 2, 3, 4 -and $_.DeviceID -ne $env:SystemDrive -and $_.FreeSpace } |
-            ForEach-Object { '{0}  {1,-20} free {2}' -f $_.DeviceID, $_.VolumeName, (Format-Size $_.FreeSpace) }
-    } catch { }
+        @(Get-CimInstance Win32_LogicalDisk -ErrorAction Stop |
+            Where-Object { $_.DriveType -in 2, 3 -and $_.DeviceID -ne $env:SystemDrive -and $_.FreeSpace -gt 1GB } |
+            Sort-Object @{ Expression = { $_.DriveType -ne 2 } }, @{ Expression = { $_.FreeSpace }; Descending = $true })
+    } catch { @() }
 }
 
 while ($true) {
@@ -307,13 +315,27 @@ while ($true) {
     try { $qual = Split-Path -Path $OutputPath -Qualifier -ErrorAction Stop } catch { }
     if ($qual -and $qual -ieq $env:SystemDrive) {
         Write-Host ''
-        Write-Host "  WARNING: The backup location ($OutputPath) is on $env:SystemDrive - the drive Windows is installed on." -ForegroundColor Red
-        Write-Host '  Reinstalling Windows will most likely ERASE it. Use a USB stick / external drive / other disk.' -ForegroundColor Red
-        Write-Host '  Other drives found:' -ForegroundColor Yellow
-        Get-OtherDrives | ForEach-Object { Write-Host "     $_" }
-        if ($Unattended) { Write-Host '  (Unattended: continuing anyway - copy the folder off this drive afterwards!)' -ForegroundColor Yellow; break }
-        $new = Read-Host '  Type a different folder (e.g. E:\) or press Enter to continue anyway'
-        if ([string]::IsNullOrWhiteSpace($new)) { [void]$Script:Warnings.Add("Backup was saved on the system drive ($OutputPath). Copy it to another drive before reinstalling!"); break }
+        Write-Host "  This kit is running from $OutputPath - that is on $env:SystemDrive, the drive Windows is on." -ForegroundColor Red
+        Write-Host '  Reinstalling Windows will ERASE a backup saved there. It needs to go on a USB stick or another drive.' -ForegroundColor Red
+        $drives = @(Get-OtherDrives)
+        $suggest = $null
+        if ($drives) {
+            Write-Host '  Other drives found:' -ForegroundColor Yellow
+            foreach ($d in $drives) { Write-Host ('     {0}  {1,-20} {2,-10} free {3}' -f $d.DeviceID, $d.VolumeName, $(if ($d.DriveType -eq 2) { 'USB' } else { 'disk' }), (Format-Size $d.FreeSpace)) }
+            $suggest = $drives[0].DeviceID + '\'
+        } else {
+            Write-Host '  No other drive found. Plug in a USB stick or external drive now.' -ForegroundColor Yellow
+        }
+        if ($Unattended) {
+            if ($suggest) { $OutputPath = $suggest; continue }
+            [void]$Script:Warnings.Add("Backup was saved on the system drive ($OutputPath). Copy it to another drive before reinstalling!"); break
+        }
+        $prompt = if ($suggest) { "  Press Enter to save the backup to $suggest (recommended), type another folder, R = re-scan drives, or C = keep it on $env:SystemDrive" }
+                  else { "  Plug in a drive and press Enter to re-scan, type a folder, or C = keep it on $env:SystemDrive" }
+        $new = Read-Host $prompt
+        if ([string]::IsNullOrWhiteSpace($new)) { if ($suggest) { $OutputPath = $suggest }; continue }
+        if ($new.Trim() -match '^[rR]$') { continue }
+        if ($new.Trim() -match '^[cC]$') { [void]$Script:Warnings.Add("Backup was saved on the system drive ($OutputPath). Copy it to another drive before reinstalling!"); break }
         $OutputPath = $new.Trim('"', ' ')
         continue
     }
