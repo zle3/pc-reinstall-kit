@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# NEW PC CHECKLIST  -  used by Setup-NewPC.ps1 (menu step "Guided checklist")
+#
+# Edit freely. Everyone's setup is different: delete what you don't need,
+# add your own lines (apps, extensions, settings you always change).
+#
+#   ## Section title          starts a new section
+#   Text of the item          a checklist item
+#   Text | link-or-command    item with something to open when you press O
+#                             (ms-settings: pages, https:// links, .cpl/.msc tools)
+#   Lines starting with # are ignored.
+#
+# Setup-NewPC.ps1 also adds items automatically for apps it found on the old PC
+# (e.g. "Discord: notifications, keybinds..."), so you don't have to list those.
+# ---------------------------------------------------------------------------
+
+## Drivers and updates
+Network driver (Ethernet / Wi-Fi) installed and internet working | ncpa.cpl
+Chipset driver from AMD / Intel or the motherboard / laptop maker's support page
+Graphics driver from NVIDIA / AMD / Intel (not just the Windows Update one)
+Audio driver (motherboard / laptop maker), then check sound works | mmsys.cpl
+Windows Update: install everything, reboot, repeat until nothing is left | ms-settings:windowsupdate
+Windows Update > Advanced options > Optional updates (driver updates) | ms-settings:windowsupdate-optionalupdates
+Microsoft Store > Library > Get updates (also updates winget / App Installer) | ms-windows-store://downloadsandupdates
+Device Manager: no devices with a yellow warning sign | devmgmt.msc
+
+## Display and sound
+Refresh rate for every monitor (Display > Advanced display > Choose a refresh rate) | ms-settings:display
+Resolution, scaling and monitor arrangement | ms-settings:display
+HDR / Night light if used | ms-settings:display
+Default playback and recording device | ms-settings:sound
+Sound: disable enhancements / spatial sound if you don't want them, set volume levels | mmsys.cpl
+Communications tab: "Do nothing" when Windows detects calls (stops volume dropping) | mmsys.cpl
+
+## Personalization
+Wallpaper / slideshow / animated wallpaper app | ms-settings:personalization-background
+Dark or light mode, accent color, transparency | ms-settings:colors
+Mouse pointer style, size and color | ms-settings:easeofaccess-mousepointer
+Pointer scheme and "Enhance pointer precision" (Mouse Properties > Pointers / Pointer Options) | main.cpl
+Taskbar: alignment, which icons show, system tray icons, auto-hide | ms-settings:taskbar
+Start menu: layout, recommendations, recently added / most used apps | ms-settings:personalization-start
+Lock screen picture and tips | ms-settings:lockscreen
+Desktop icons (This PC, Recycle Bin ...) | ms-settings:themes
+
+## Privacy and system
+Privacy & security: go through EVERY page (general, speech, inking, diagnostics, activity history, search, app permissions) | ms-settings:privacy
+Notifications: turn off the apps and Windows tips you don't want | ms-settings:notifications
+Turn off recent files / recommendations in Start and File Explorer (Folder Options > Privacy) | ms-settings:personalization-start
+File Explorer options: show file extensions, hidden files, open to This PC | control.exe folders
+Multitasking: snap windows, Alt+Tab Edge tabs, title bar shake | ms-settings:multitasking
+Fast startup on/off (Choose what the power buttons do) | control.exe /name Microsoft.PowerOptions /page pageGlobalSettings
+Power plan, sleep and screen-off timers | ms-settings:powersleep
+Startup apps: turn off what you don't need at boot | ms-settings:startupapps
+Default apps: browser, media player, PDF reader, photo viewer | ms-settings:defaultapps
+OneDrive: keep and sign in, or uninstall if you don't use it | ms-settings:appsfeatures
+Remove preinstalled apps you don't want | ms-settings:appsfeatures
+Keyboard languages / layouts | ms-settings:regionlanguage
+Time zone, set time automatically | ms-settings:dateandtime
+Storage Sense (automatic cleanup) | ms-settings:storagesense
+Game Mode / Xbox Game Bar capture settings | ms-settings:gaming-gamebar
+
+## Browser
+Sign in to browser sync, or restore bookmarks (step 5 of the setup menu)
+Browser settings: start page, search engine, download folder, privacy / tracking, cookies
+Reinstall browser extensions (password manager, ad blocker ...) - links are in report.html
+Set your browser as default | ms-settings:defaultapps
+Password manager signed in, 2FA / authenticator working
+
+## Apps and accounts
+Sign in to each app; then check its settings: start with Windows, notifications, keybinds, audio input/output device
+Peripheral software (mouse / keyboard / headset / controller): DPI, button assignments, macros, lighting
+Game launchers: point them at existing game folders on other drives instead of downloading again
+Microsoft account / email / calendar / OneDrive / Office signed in | ms-settings:emailandaccounts
+Printers and scanners added | ms-settings:printers
+
+## Security and backup
+Windows Security shows no warnings | windowsdefender:
+Device encryption / BitLocker (save the recovery key somewhere safe) | ms-settings:deviceencryption
+System Protection / restore points on for C: | SystemPropertiesProtection.exe
+A backup plan for personal files (OneDrive, File History, external drive) | ms-settings:backup

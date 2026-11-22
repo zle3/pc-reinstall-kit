@@ -1,0 +1,5 @@
+# Backups and logs contain personal data (Wi-Fi passwords, browser data, files) - never commit them
+PCBackup_*/
+setup-progress*.json
+Logs/
+*.zip
