@@ -54,6 +54,36 @@ if (-not $IsAdmin -and -not $NoElevate) {
     catch { Write-Host 'Continuing without admin rights - drivers, features and some settings will be skipped.' -ForegroundColor Yellow }
 }
 
+function Disable-QuickEdit {
+    # In the classic console, clicking the window starts "Select" mode and FREEZES the script until
+    # Enter/Esc is pressed. Turn QuickEdit off for this window so a stray click cannot pause a long copy.
+    try {
+        if (-not ('PCKit.ConsoleMode' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace PCKit {
+public static class ConsoleMode {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GetStdHandle(int h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr h, out uint m);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleMode(IntPtr h, uint m);
+    public static bool DisableQuickEdit() {
+        IntPtr h = GetStdHandle(-10);
+        uint m;
+        if (!GetConsoleMode(h, out m)) return false;
+        m &= ~0x0040u;   // ENABLE_QUICK_EDIT_MODE
+        m |= 0x0080u;    // ENABLE_EXTENDED_FLAGS (required for the change to stick)
+        return SetConsoleMode(h, m);
+    }
+}
+}
+"@
+        }
+        [void][PCKit.ConsoleMode]::DisableQuickEdit()
+    } catch { }
+}
+Disable-QuickEdit
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -929,7 +959,7 @@ function Step-Files {
     $free = (Get-PSDrive -Name ($env:SystemDrive.TrimEnd(':'))).Free
     if ($need -gt $free * 0.95) { Write-Warn2 ("Need {0}, only {1} free on {2}." -f (Format-Size $need), (Format-Size $free), $env:SystemDrive); if (-not (Ask-YesNo 'Continue anyway?' $false)) { return $false } }
     foreach ($r in $sel) {
-        Write-Info "Copying $($r.Folder) ($($r.Size)) -> $($r.RestoreTo)"
+        Write-Info "Copying $($r.Folder) ($($r.Size)) -> $($r.RestoreTo)  (large folders take a while - no need to press anything)"
         if (Invoke-Robo $r.Source $r.RestoreTo) { Write-Ok $r.Folder } else { Write-Warn2 "$($r.Folder): some files failed (Logs\restore-robocopy.log)" }
     }
     if ($M.OutlookPST) {

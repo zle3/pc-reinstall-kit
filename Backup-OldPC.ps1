@@ -65,6 +65,36 @@ if (-not $IsAdmin -and -not $NoElevate) {
     }
 }
 
+function Disable-QuickEdit {
+    # In the classic console, clicking the window starts "Select" mode and FREEZES the script until
+    # Enter/Esc is pressed. Turn QuickEdit off for this window so a stray click cannot pause a long copy.
+    try {
+        if (-not ('PCKit.ConsoleMode' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace PCKit {
+public static class ConsoleMode {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GetStdHandle(int h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr h, out uint m);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleMode(IntPtr h, uint m);
+    public static bool DisableQuickEdit() {
+        IntPtr h = GetStdHandle(-10);
+        uint m;
+        if (!GetConsoleMode(h, out m)) return false;
+        m &= ~0x0040u;   // ENABLE_QUICK_EDIT_MODE
+        m |= 0x0080u;    // ENABLE_EXTENDED_FLAGS (required for the change to stick)
+        return SetConsoleMode(h, m);
+    }
+}
+}
+"@
+        }
+        [void][PCKit.ConsoleMode]::DisableQuickEdit()
+    } catch { }
+}
+Disable-QuickEdit
+
 # ---------------------------------------------------------------------------
 # Console helpers
 # ---------------------------------------------------------------------------
@@ -1691,7 +1721,7 @@ Invoke-Step 'Copy user files' {
     }
     foreach ($f in $sel) {
         $dest = Join-Path $Dirs.UserFiles ("{0}\{1}" -f (Get-SafeName $f.User), (Get-SafeName $f.Folder))
-        Write-Info ("Copying {0} {1} ({2})..." -f $f.User, $f.Folder, $f.Size)
+        Write-Info ("Copying {0} {1} ({2})... large folders take a while - this is normal, no need to press anything" -f $f.User, $f.Folder, $f.Size)
         $ok = Invoke-Robo $f.Path $dest @('/XD', 'node_modules', '$RECYCLE.BIN', 'My Music', 'My Pictures', 'My Videos', '/XF', 'desktop.ini', 'Thumbs.db', '*.tmp', '~$*')
         $f.Copied = $ok
         $f.Backup = $dest.Substring($B.Length + 1)
