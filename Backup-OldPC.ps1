@@ -33,13 +33,18 @@
 param(
     [string]$OutputPath,
     [switch]$Unattended,
-    [switch]$NoElevate
+    [switch]$NoElevate,
+    [switch]$Console,          # force the text-only console version
+    [switch]$KitWorker,        # internal: runs inside the app window
+    $KitSync                   # internal: message channel to the app window
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$ScriptVersion = '1.0'
+$AppVersion = '1.1.0'
+$ScriptVersion = $AppVersion
+$KitFiles = @('1-BACKUP-OLD-PC.bat', '2-SETUP-NEW-PC.bat', 'Backup-OldPC.ps1', 'Setup-NewPC.ps1', 'Kit-UI.ps1', 'checklist.txt', 'README.txt')
 
 # ---------------------------------------------------------------------------
 # Elevation
@@ -52,16 +57,49 @@ function Test-IsAdmin {
 }
 
 $IsAdmin = Test-IsAdmin
-if (-not $IsAdmin -and -not $NoElevate) {
+if (-not $IsAdmin -and -not $NoElevate -and -not $KitWorker) {
     Write-Host 'Requesting administrator rights (needed for drivers, Wi-Fi passwords, BitLocker keys, other users)...' -ForegroundColor Yellow
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-NoElevate')
+    $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-NoElevate')
     if ($OutputPath) { $argList += @('-OutputPath', "`"$OutputPath`"") }
     if ($Unattended) { $argList += '-Unattended' }
+    if ($Console) { $argList += '-Console' }
     try {
-        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -ErrorAction Stop
+        if ($Console) { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -ErrorAction Stop }
+        else { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -WindowStyle Hidden -ErrorAction Stop }
         exit
     } catch {
         Write-Host 'Elevation was declined. Continuing WITHOUT admin rights (some sections will be skipped).' -ForegroundColor Yellow
+    }
+}
+
+# ---------------------------------------------------------------------------
+# App window (Kit-UI.ps1). Falls back to this console if the window cannot open.
+# ---------------------------------------------------------------------------
+if (-not $KitWorker -and -not $Console) {
+    $kitUi = Join-Path $PSScriptRoot 'Kit-UI.ps1'
+    if (Test-Path -LiteralPath $kitUi) {
+        . $kitUi
+        if (Test-KitGuiAvailable) {
+            Set-KitConsoleVisible $false
+            try {
+                Start-KitApp -Mode Backup -ScriptPath $PSCommandPath -Version $AppVersion `
+                    -ScriptArgs @{ OutputPath = $OutputPath; Unattended = [bool]$Unattended; NoElevate = $true } `
+                    -Subtitle "Back up $env:COMPUTERNAME before reinstalling Windows" `
+                    -Steps @('System info', 'Windows license and BitLocker', 'Installed apps', 'Drivers and devices', 'Network and printers', 'Windows settings', 'Browsers', 'App settings', 'Your files', 'Report and app list') `
+                    -IntroLines @(
+                        '# What this does',
+                        'Saves a list of your apps, drivers, Windows settings, Wi-Fi networks, printers and browser data (bookmarks, extensions), plus copies of your personal files if you want.',
+                        'Nothing is deleted or changed on this PC. Everything is saved to a folder you choose - use a USB stick or external drive.',
+                        'When it is done, that drive also holds everything needed to set up the new Windows.',
+                        '',
+                        '> Close your browsers and save your work, then click "Start backup".'
+                    )
+                exit
+            } catch {
+                Set-KitConsoleVisible $true
+                Write-Host "Could not open the app window ($($_.Exception.Message)). Continuing in this console." -ForegroundColor Yellow
+            }
+        }
     }
 }
 
@@ -142,7 +180,22 @@ function Invoke-Step([string]$Name, [scriptblock]$Block) {
 }
 
 function Save-Json($Object, [string]$Path) {
-    $Object | ConvertTo-Json -Depth 10 | Set-Content -Path $Path -Encoding UTF8
+    # Converts one top-level section at a time (Depth 6 is plenty for this data). Windows PowerShell 5.1's
+    # ConvertTo-Json can take minutes if a deep, rich .NET object slips in, so slow sections are reported.
+    if ($Object -is [System.Collections.IDictionary]) {
+        $parts = New-Object System.Collections.Generic.List[string]
+        foreach ($key in @($Object.Keys)) {
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $json = ConvertTo-Json -InputObject $Object[$key] -Depth 6 -Compress
+            $sw.Stop()
+            if ($sw.Elapsed.TotalSeconds -gt 3) { Add-Content -Path $Script:ErrLog -Value ("[{0}] manifest section '{1}' took {2:N1}s to save" -f (Get-Date), $key, $sw.Elapsed.TotalSeconds) -ErrorAction SilentlyContinue }
+            if ($null -eq $json -or $json -eq '') { $json = 'null' }
+            $parts.Add(('  {0}: {1}' -f (ConvertTo-Json -InputObject ([string]$key) -Compress), $json))
+        }
+        ("{`r`n" + ($parts -join ",`r`n") + "`r`n}") | Set-Content -Path $Path -Encoding UTF8
+    } else {
+        ConvertTo-Json -InputObject $Object -Depth 6 | Set-Content -Path $Path -Encoding UTF8
+    }
 }
 
 function Read-JsonFile([string]$Path) {
@@ -191,13 +244,16 @@ function Invoke-Robo([string]$Source, [string]$Dest, [string[]]$Extra = @()) {
     if ($xd -ge 0) { $Extra = @($Extra[0..$xd]) + @($B) + @($Extra | Select-Object -Skip ($xd + 1)) }
     else { $Extra += @('/XD', $B) }
     $roboArgs = @($Source, $Dest, '/E', '/R:1', '/W:1', '/XJ', '/MT:16', '/NP', '/NFL', '/NDL', "/LOG+:$Script:RoboLog") + $Extra
+    if ($Script:Gui) { Send-KitMessage @{ T = 'progress'; Text = "Copying $(Split-Path $Source -Leaf)... large folders take a while"; Indeterminate = $true } }
     & robocopy.exe @roboArgs | Out-Null
-    return ($LASTEXITCODE -lt 8)
+    $code = $LASTEXITCODE
+    if ($Script:Gui) { Send-KitMessage @{ T = 'progress'; Done = $true } }
+    return ($code -lt 8)
 }
 
 function Select-FromList {
     # Console multi-select. Enter = the -Default items. Returns the chosen items.
-    param([object[]]$Items, [scriptblock]$Label, [string]$Prompt = 'Enter numbers (e.g. 1,3,5-7), A = all, Enter = none', [object[]]$Default = @())
+    param([object[]]$Items, [scriptblock]$Label, [string]$Prompt = 'Enter numbers (e.g. 1,3,5-7), A = all, Enter = none', [object[]]$Default = @(), [scriptblock]$GuiRow, [string]$Title)
     if (-not $Items -or $Items.Count -eq 0) { return @() }
     for ($i = 0; $i -lt $Items.Count; $i++) { Write-Host ("   {0,3}. {1}" -f ($i + 1), (& $Label $Items[$i])) }
     if ($Unattended) { return @() }
@@ -215,6 +271,59 @@ function Select-FromList {
 
 function Get-RegValue([string]$Path, [string]$Name) {
     try { return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
+}
+
+function Wait-Enter([string]$Text = 'Press Enter to continue') { if (-not $Unattended) { [void](Read-Host "  $Text") } }
+
+# ---------------------------------------------------------------------------
+# Window mode: send output and questions to the app window instead of the console
+# ---------------------------------------------------------------------------
+$Script:Gui = [bool]$KitWorker
+if ($Script:Gui) {
+    $Script:KitSync = $KitSync
+    . (Join-Path $PSScriptRoot 'Kit-UI.ps1')
+    $Script:KitLogFile = $null
+    function Send-KitLog([string]$Text, [string]$Level = 'info') {
+        Send-KitMessage @{ T = 'log'; Text = $Text; Level = $Level }
+        if ($Script:KitLogFile) { try { Add-Content -LiteralPath $Script:KitLogFile -Value ('[{0}] {1,-4} {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Text) -ErrorAction Stop } catch { } }
+    }
+    function Write-Host {
+        param([Parameter(Position = 0, ValueFromRemainingArguments = $true)]$Object, $ForegroundColor, $BackgroundColor, [switch]$NoNewline, $Separator)
+        $t = (@($Object) | ForEach-Object { "$_" }) -join ' '
+        if ($NoNewline) { Send-KitMessage @{ T = 'progress'; Text = $t.Trim() }; return }
+        $t = ($t.Trim() -replace '^-\s+', '')
+        if (-not $t -or $t -match '^[=\-\s]+$') { return }
+        $lvl = switch ("$ForegroundColor") { 'Green' { 'ok' } 'Yellow' { 'warn' } 'Red' { 'fail' } 'Cyan' { 'todo' } 'White' { 'sub' } default { 'info' } }
+        Send-KitLog $t $lvl
+    }
+    function Clear-Host { }
+    function Read-Host { param([Parameter(Position = 0)]$Prompt) return (Show-KitInput "$Prompt".Trim() '') }
+    function Write-Ok([string]$Text)    { Send-KitLog $Text 'ok' }
+    function Write-Info([string]$Text)  { Send-KitLog $Text 'info' }
+    function Write-Warn2([string]$Text) { Send-KitLog $Text 'warn'; [void]$Script:Warnings.Add($Text) }
+    function Write-Fail([string]$Text)  { Send-KitLog $Text 'fail'; [void]$Script:Errors.Add($Text) }
+    function Write-Section([string]$Text) {
+        if ($Script:StepNo -gt 0) { Send-KitMessage @{ T = 'step'; Index = $Script:StepNo - 1; State = 'done' } }
+        $Script:StepNo++
+        Send-KitMessage @{ T = 'step'; Index = $Script:StepNo - 1; State = 'running' }
+        Send-KitMessage @{ T = 'status'; Text = $Text }
+        Send-KitMessage @{ T = 'progress'; Done = $true }
+        Send-KitLog $Text 'head'
+    }
+    function Ask-YesNo([string]$Question, [bool]$Default = $true) { if ($Unattended) { return $Default }; return (Show-KitYesNo $Question $Default) }
+    function Wait-Enter([string]$Text = 'Continue') { if (-not $Unattended) { Show-KitInfo ($Text -replace '^Press Enter (when|to) ', '' -replace '\s*\(or to skip\)', '') 'Continue' } }
+    function Select-FromList {
+        param([object[]]$Items, [scriptblock]$Label, [string]$Prompt, [object[]]$Default = @(), [scriptblock]$GuiRow, [string]$Title = 'Choose')
+        if (-not $Items -or $Unattended) { return @() }
+        $rows = @(); $checked = @()
+        foreach ($it in $Items) {
+            if ($GuiRow) { $rows += (& $GuiRow $it) } else { $rows += @{ Main = "$(& $Label $it)".Trim(); Sub = '' } }
+            $checked += [bool]($Default -contains $it)
+        }
+        $idx = Show-KitSelect -Title $Title -Text $Prompt -Rows $rows -Checked $checked -OkText 'Continue' -SkipText 'None'
+        return @($idx | ForEach-Object { $Items[$_] })
+    }
+    Send-KitMessage @{ T = 'steps'; Titles = @('System info', 'Windows license and BitLocker', 'Installed apps', 'Drivers and devices', 'Network and printers', 'Windows settings', 'Browsers', 'App settings', 'Your files', 'Report and app list') }
 }
 
 # ---------------------------------------------------------------------------
@@ -321,7 +430,7 @@ function Get-KeyFromDigitalProductId([byte[]]$Id) {
 # ---------------------------------------------------------------------------
 Clear-Host
 Write-Host '======================================================================' -ForegroundColor Cyan
-Write-Host '  OLD PC BACKUP & INVENTORY  (before reinstalling Windows)' -ForegroundColor Cyan
+Write-Host "  PC REINSTALL KIT v$AppVersion  -  BACK UP THIS PC (before reinstalling Windows)" -ForegroundColor Cyan
 Write-Host '======================================================================' -ForegroundColor Cyan
 Write-Host "  Computer : $env:COMPUTERNAME"
 Write-Host "  User     : $env:USERNAME   ($env:USERPROFILE)"
@@ -340,7 +449,37 @@ function Get-OtherDrives {
     } catch { @() }
 }
 
-while ($true) {
+if ($Script:Gui -and -not $Unattended) {
+    # Window mode: always confirm where the backup goes. USB drives first; the kit is copied there too.
+    while ($true) {
+        $drives = @(Get-OtherDrives)
+        $opts = @(); $paths = @()
+        foreach ($d in $drives) {
+            $kind = if ($d.DriveType -eq 2) { 'USB drive' } else { 'Drive' }
+            $label = if ($d.VolumeName) { " ($($d.VolumeName))" } else { '' }
+            $rec = if ($paths.Count -eq 0) { '  (recommended)' } else { '' }
+            $opts += ('{0} {1}{2} - {3} free{4}' -f $kind, $d.DeviceID, $label, (Format-Size $d.FreeSpace), $rec)
+            $paths += ($d.DeviceID + '\')
+        }
+        $opts += 'Choose another folder...'; $paths += '?folder'
+        $opts += 'Look for drives again (plug in a USB stick first)'; $paths += '?rescan'
+        $opts += "Save on $env:SystemDrive anyway (not recommended - a reinstall erases it)"; $paths += '?system'
+        $msg = if ($drives) { 'Where should the backup be saved? Pick your USB stick or external drive. The setup program for the new Windows is copied there too.' }
+               else { 'No USB stick or second drive found. Plug one in and choose "Look for drives again", or pick a folder.' }
+        $c = Show-KitChoice $msg $opts 0
+        if ($c -lt 0) { throw 'Backup cancelled.' }
+        $pick = $paths[$c]
+        if ($pick -eq '?rescan') { continue }
+        if ($pick -eq '?system') { [void]$Script:Warnings.Add('Backup was saved on the system drive. Copy it to another drive before reinstalling!'); break }
+        if ($pick -eq '?folder') { $f = Show-KitFolder 'Choose where to save the backup (a USB stick or external drive is best)'; if (-not $f) { continue }; $OutputPath = $f }
+        else { $OutputPath = $pick }
+        $q = $null; try { $q = Split-Path -Path $OutputPath -Qualifier -ErrorAction Stop } catch { }
+        if ($q -and $q -ieq $env:SystemDrive -and -not (Show-KitYesNo "$OutputPath is on $env:SystemDrive, the drive Windows is on. A reinstall will erase the backup. Use it anyway?" $false)) { continue }
+        break
+    }
+}
+
+while (-not $Script:Gui -or $Unattended) {
     $qual = $null
     try { $qual = Split-Path -Path $OutputPath -Qualifier -ErrorAction Stop } catch { }
     if ($qual -and $qual -ieq $env:SystemDrive) {
@@ -380,6 +519,7 @@ foreach ($d in 'Apps', 'Drivers', 'Network', 'Settings', 'Browsers', 'AppConfigs
     New-Item -ItemType Directory -Path $Dirs[$d] -Force | Out-Null
 }
 $Script:ErrLog = Join-Path $Dirs.Logs 'errors.log'
+if ($Script:Gui) { $Script:KitLogFile = Join-Path $Dirs.Logs 'backup-log.txt'; Send-KitMessage @{ T = 'subtitle'; Text = "Saving to $B" } }
 $Script:RoboLog = Join-Path $Dirs.Logs 'robocopy.log'
 try { Start-Transcript -Path (Join-Path $Dirs.Logs 'backup-transcript.txt') -Force | Out-Null } catch { }
 
@@ -875,7 +1015,7 @@ Invoke-Step 'Network' {
     if ($wifi) { Write-Ok ("{0} Wi-Fi networks saved{1}" -f $wifi.Count, $(if ($IsAdmin) { ' (with passwords - Network\WiFi is PRIVATE)' } else { '' })) }
 
     try {
-        $net.Adapters = @(Get-NetIPConfiguration -ErrorAction Stop | Where-Object { $_.NetAdapter.Status -eq 'Up' } | ForEach-Object {
+        $net.Adapters = @(Get-NetIPConfiguration -ErrorAction Stop | Where-Object { $_.NetAdapter.Status -eq 'Up' -and $_.InterfaceAlias -notmatch '^vEthernet|Loopback' -and $_.InterfaceDescription -notmatch 'Hyper-V|Virtual|VMware|VirtualBox|TAP-|Wintun|WireGuard|ZeroTier|Tailscale|Npcap|WSL' } | ForEach-Object {
             $dhcp = (Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
             [pscustomobject]@{
                 Name = $_.InterfaceAlias; Description = $_.InterfaceDescription
@@ -893,7 +1033,8 @@ Invoke-Step 'Network' {
     $hosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     if (Test-Path $hosts) {
         Copy-Item $hosts (Join-Path $Dirs.Network 'hosts.txt') -Force -ErrorAction SilentlyContinue
-        $net.HostsEntries = @(Get-Content $hosts -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*[^#\s]' })
+        # "$_" makes plain strings: Get-Content lines carry PSPath/PSDrive/PSProvider, which ConvertTo-Json follows forever.
+        $net.HostsEntries = @(Get-Content $hosts -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { "$_" })
         if ($net.HostsEntries) { Write-Info "$($net.HostsEntries.Count) custom hosts-file entries saved" }
     }
 
@@ -1503,7 +1644,7 @@ Invoke-Step 'Browser passwords' {
         Write-Info "Address: $($pg.Url)"
         Write-Info "Then: $($pg.Steps)"
         Write-Info 'Save the CSV to Downloads, Desktop or Documents so it is picked up automatically.'
-        if (-not $Unattended) { [void](Read-Host '     Press Enter when the export is saved (or to skip)') }
+        Wait-Enter "Press Enter when the $brw passwords are exported and saved (or to skip)"
     }
     $pwDir = Join-Path $Dirs.Browsers 'PasswordExports-PRIVATE'
     $found = @()
@@ -1712,7 +1853,7 @@ Invoke-Step 'Copy user files' {
     Write-Host '  OneDrive folders are already in the cloud if OneDrive finished syncing - copying them may download online-only files.' -ForegroundColor DarkGray
     $recommended = @($M.UserFolders | Where-Object { $_.Kind -eq 'Known' -and $_.User -eq $env:USERNAME -and -not $_.OneDrive -and $_.Folder -ne 'Links' })
     Write-Host '  * = recommended (your Desktop, Documents, Pictures ... that are not already in OneDrive)' -ForegroundColor DarkGray
-    $sel = Select-FromList -Items $M.UserFolders -Default $recommended -Label { param($x) ('{0}{1,-14} {2,-20} {3,10}  {4}{5}' -f $(if ($recommended -contains $x) { '* ' } else { '  ' }), $x.User, $x.Folder, $x.Size, $x.Path, $(if ($x.OneDrive) { '  [OneDrive]' } else { '' })) } -Prompt 'Press Enter to copy the * folders (recommended). Or: A = all, N = none, numbers like 1,3,5-7'
+    $sel = Select-FromList -Items $M.UserFolders -Default $recommended -Title 'Which folders should be copied?' -GuiRow { param($x) @{ Main = ('{0}  ({1}){2}' -f $(if ($x.User -eq $env:USERNAME) { $x.Folder } else { "$($x.User): $($x.Folder)" }), $x.Size, $(if ($x.OneDrive) { '  - in OneDrive' } else { '' })); Sub = $x.Path } } -Label { param($x) ('{0}{1,-14} {2,-20} {3,10}  {4}{5}' -f $(if ($recommended -contains $x) { '* ' } else { '  ' }), $x.User, $x.Folder, $x.Size, $x.Path, $(if ($x.OneDrive) { '  [OneDrive]' } else { '' })) } -Prompt 'Press Enter to copy the * folders (recommended). Or: A = all, N = none, numbers like 1,3,5-7'
     if (-not $sel) { Write-Info 'No user folders copied. Make sure personal files are saved elsewhere before wiping!'; Write-Warn2 'User files were NOT copied by this script.'; return }
     $need = ($sel | Measure-Object SizeBytes -Sum).Sum
     if ($freeBytes -and $need -gt $freeBytes * 0.95) {
@@ -2074,6 +2215,41 @@ foreach ($d in (Get-ChildItem -LiteralPath $B -Force -ErrorAction SilentlyContin
 }
 try { Stop-Transcript | Out-Null } catch { }
 
+# Make the backup drive a ready-to-use setup stick: copy the kit next to the backup + a START HERE note.
+$KitRoot = Split-Path $B -Parent
+$kitCopied = $false
+if ($PSScriptRoot -and ((Resolve-Path -LiteralPath $KitRoot).Path.TrimEnd('\') -ne (Resolve-Path -LiteralPath $PSScriptRoot).Path.TrimEnd('\'))) {
+    try {
+        foreach ($f in $KitFiles) {
+            $src = Join-Path $PSScriptRoot $f
+            if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $KitRoot $f) -Force -ErrorAction Stop }
+        }
+        $kitCopied = $true
+    } catch { Write-Warn2 "Could not copy the setup program to $KitRoot ($($_.Exception.Message)). Copy the kit files there yourself." }
+}
+$startHere = Join-Path $KitRoot 'START HERE - after reinstalling Windows.txt'
+@(
+    "PC REINSTALL KIT v$AppVersion"
+    '=================================================================='
+    ''
+    "This drive holds the backup of $env:COMPUTERNAME made on $(Get-Date -Format 'd MMMM yyyy')"
+    "(folder $(Split-Path $B -Leaf))."
+    ''
+    'BEFORE WIPING THE OLD PC'
+    "  Open $(Split-Path $B -Leaf)\CHECKLIST.txt and go through it."
+    ''
+    'AFTER REINSTALLING WINDOWS'
+    '  1. Plug this drive into the PC.'
+    '  2. Open this drive in File Explorer.'
+    '  3. Double-click  2-SETUP-NEW-PC.bat  and click Yes when Windows asks for permission.'
+    '     (If Windows says "Windows protected your PC": click More info > Run anyway.)'
+    '  4. Click "Start setup". It finds this backup by itself and goes through every step.'
+    ''
+    "Your app list (with download links): $(Split-Path $B -Leaf)\apps.html"
+    ''
+    'Keep this drive private: it contains Wi-Fi passwords and browser data.'
+) | Set-Content -LiteralPath $startHere -Encoding UTF8
+
 Write-Host ''
 Write-Host '======================================================================' -ForegroundColor Green
 Write-Host "  BACKUP COMPLETE  ($(Format-Size $total))" -ForegroundColor Green
@@ -2092,7 +2268,17 @@ Write-Host ''
 Write-Host '  Files containing secrets (keep the drive private):' -ForegroundColor Yellow
 Write-Host '   Network\WiFi (Wi-Fi passwords), System\BitLocker-*, Browsers\PasswordExports-PRIVATE, Browsers\*\Firefox (saved logins), AppConfigs\SSH*' -ForegroundColor Yellow
 Write-Host ''
-Write-Host '  Next: read CHECKLIST.txt before wiping. After reinstalling, run 2-SETUP-NEW-PC.bat.' -ForegroundColor Cyan
+Write-Host "  Next: read CHECKLIST.txt before wiping. After reinstalling, plug in this drive and run 2-SETUP-NEW-PC.bat from $KitRoot" -ForegroundColor Cyan
+if ($Script:Gui) {
+    Send-KitMessage @{ T = 'step'; Index = $Script:StepNo - 1; State = 'done' }
+    Send-KitMessage @{ T = 'paths'; Folder = $KitRoot; Report = (Join-Path $B 'report.html'); Apps = (Join-Path $B 'apps.html'); Checklist = (Join-Path $B 'CHECKLIST.txt') }
+    Send-KitMessage @{ T = 'done'; Text = "Backup complete ($(Format-Size $total))" }
+    if (-not $Unattended) {
+        $where = if ($kitCopied) { "Everything is on $KitRoot - the backup AND the setup program." } else { "The backup is in $B." }
+        Show-KitInfo ("Backup complete.`n`n$where`n`nNext:`n1. Open the checklist (button below) and finish it before wiping this PC.`n2. After reinstalling Windows, plug this drive in and double-click 2-SETUP-NEW-PC.bat on it.`n`nThe same steps are in 'START HERE - after reinstalling Windows.txt' on the drive.") 'Got it'
+    }
+    return
+}
 if (-not $Unattended) {
     try { Start-Process (Join-Path $B 'report.html') } catch { }
     try { Start-Process (Join-Path $B 'apps.html') } catch { }

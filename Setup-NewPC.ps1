@@ -32,12 +32,16 @@
 param(
     [string]$BackupPath,
     [switch]$NoGrid,
-    [switch]$NoElevate
+    [switch]$NoElevate,
+    [switch]$Console,          # force the text-only console version
+    [switch]$KitWorker,        # internal: runs inside the app window
+    $KitSync                   # internal: message channel to the app window
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
+$AppVersion = '1.1.0'
 
 function Test-IsAdmin {
     try {
@@ -46,12 +50,40 @@ function Test-IsAdmin {
     } catch { return $false }
 }
 $IsAdmin = Test-IsAdmin
-if (-not $IsAdmin -and -not $NoElevate) {
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-NoElevate')
+if (-not $IsAdmin -and -not $NoElevate -and -not $KitWorker) {
+    $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-NoElevate')
     if ($BackupPath) { $argList += @('-BackupPath', "`"$BackupPath`"") }
     if ($NoGrid) { $argList += '-NoGrid' }
-    try { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -ErrorAction Stop; exit }
+    if ($Console) { $argList += '-Console' }
+    try {
+        if ($Console) { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -ErrorAction Stop }
+        else { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -WindowStyle Hidden -ErrorAction Stop }
+        exit
+    }
     catch { Write-Host 'Continuing without admin rights - drivers, features and some settings will be skipped.' -ForegroundColor Yellow }
+}
+
+# ---------------------------------------------------------------------------
+# App window (Kit-UI.ps1). Falls back to this console if the window cannot open.
+# ---------------------------------------------------------------------------
+if (-not $KitWorker -and -not $Console) {
+    $kitUi = Join-Path $PSScriptRoot 'Kit-UI.ps1'
+    if (Test-Path -LiteralPath $kitUi) {
+        . $kitUi
+        if (Test-KitGuiAvailable) {
+            Set-KitConsoleVisible $false
+            try {
+                Start-KitApp -Mode Setup -ScriptPath $PSCommandPath -Version $AppVersion -AutoStart `
+                    -ScriptArgs @{ BackupPath = $BackupPath; NoElevate = $true } `
+                    -Subtitle 'Set up this PC after reinstalling Windows' `
+                    -IntroLines @('Looking for your backup...')
+                exit
+            } catch {
+                Set-KitConsoleVisible $true
+                Write-Host "Could not open the app window ($($_.Exception.Message)). Continuing in this console." -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 function Disable-QuickEdit {
@@ -360,11 +392,91 @@ public static class Native {
 '@
 }
 
+function Write-KitOutput {
+    # Shows output of programs like winget: console as-is, window as readable lines only.
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process {
+        if (-not $Script:Gui) { $InputObject | Out-Host; return }
+        foreach ($piece in ("$InputObject" -split "`r")) {
+            $t = ($piece -replace '[^\x20-\x7E]', ' ' -replace '\s{2,}', ' ').Trim()
+            if ($t.Length -lt 4 -or $t -notmatch '[A-Za-z]{3}') { continue }
+            if ($t -match '^\S*\s*[\d.]+\s*(B|KB|MB|GB)\s*/\s*[\d.]+\s*(B|KB|MB|GB)') { continue }
+            if ($t -match '^[\-\\|/ ]+$' -or $t -eq $Script:LastKitOut) { continue }
+            $Script:LastKitOut = $t
+            Send-KitLog $t 'info'
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Window mode: send output and questions to the app window instead of the console
+# ---------------------------------------------------------------------------
+$Script:Gui = [bool]$KitWorker
+if ($Script:Gui) {
+    $Script:KitSync = $KitSync
+    . (Join-Path $PSScriptRoot 'Kit-UI.ps1')
+    $Script:KitLogFile = $null
+    function Send-KitLog([string]$Text, [string]$Level = 'info') {
+        Send-KitMessage @{ T = 'log'; Text = $Text; Level = $Level }
+        if ($Script:KitLogFile) { try { Add-Content -LiteralPath $Script:KitLogFile -Value ('[{0}] {1,-4} {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Text) -ErrorAction Stop } catch { } }
+    }
+    function Write-Host {
+        param([Parameter(Position = 0, ValueFromRemainingArguments = $true)]$Object, $ForegroundColor, $BackgroundColor, [switch]$NoNewline, $Separator)
+        $t = (@($Object) | ForEach-Object { "$_" }) -join ' '
+        if ($NoNewline) { Send-KitMessage @{ T = 'progress'; Text = $t.Trim() }; return }
+        $t = $t.Trim()
+        if (-not $t -or $t -match '^[=\-\s]+$') { return }
+        $lvl = switch ("$ForegroundColor") { 'Green' { 'ok' } 'Yellow' { 'warn' } 'Red' { 'fail' } 'Cyan' { 'todo' } 'White' { 'info' } default { 'info' } }
+        Send-KitLog $t $lvl
+    }
+    function Clear-Host { }
+    function Read-Host { param([Parameter(Position = 0)]$Prompt) return (Show-KitInput "$Prompt".Trim() '') }
+    function Write-Title([string]$Text) { if ($Text -like 'PC REINSTALL KIT*') { return }; Send-KitMessage @{ T = 'status'; Text = ($Text -replace '^Step \d+ - ', '') }; Send-KitLog $Text 'head' }
+    function Write-Sub([string]$Text)   { Send-KitLog $Text 'sub' }
+    function Write-Ok([string]$Text)    { Send-KitLog $Text 'ok' }
+    function Write-Info([string]$Text)  { Send-KitLog $Text 'info' }
+    function Write-Todo([string]$Text)  { Send-KitLog $Text 'todo' }
+    function Write-Warn2([string]$Text) { Send-KitLog $Text 'warn' }
+    function Write-Fail([string]$Text)  { Send-KitLog $Text 'fail' }
+    function Ask-YesNo([string]$Question, [bool]$Default = $true) { return (Show-KitYesNo $Question $Default) }
+    function Wait-Enter([string]$Text = 'Continue') {
+        $t = $Text -replace '^Press Enter (when|after|to) ', '' -replace '\s*\(.*\)\s*$', ''
+        if (-not $t) { $t = 'you are ready' } else { $t = $t.Substring(0, 1).ToUpper() + $t.Substring(1) }
+        Show-KitInfo "Click Continue when: $t" 'Continue'
+    }
+    function Select-Items {
+        param([object[]]$Items, [string]$Title, [string[]]$Property, [switch]$Single, [switch]$PreselectAllHint)
+        if (-not $Items -or @($Items).Count -eq 0) { return @() }
+        $Items = @($Items)
+        $rows = @(foreach ($it in $Items) {
+            $vals = @($Property | ForEach-Object { $v = $it.$_; if ($v -is [array]) { $v -join ', ' } else { "$v" } } | Where-Object { $_ -and $_ -ne 'False' })
+            @{ Main = $(if ($vals.Count) { $vals[0] } else { "$it" }); Sub = (@($vals | Select-Object -Skip 1) -join '  -  ') }
+        })
+        $idx = Show-KitSelect -Title $Title -Rows $rows -Single:$Single -OkText $(if ($Single) { 'Choose' } else { 'Continue' }) -SkipText 'Cancel'
+        return @($idx | ForEach-Object { $Items[$_] })
+    }
+    function Confirm-Selection {
+        param([object[]]$Items, [string]$Title, [string[]]$Property, [string]$What = 'items', [object[]]$Default, [switch]$NoDefault)
+        if (-not $Items -or @($Items).Count -eq 0) { return @() }
+        $Items = @($Items)
+        if ($NoDefault) { $Default = @() } elseif (-not $PSBoundParameters.ContainsKey('Default')) { $Default = $Items } else { $Default = @($Default) }
+        $rows = @(); $checked = @()
+        foreach ($it in $Items) {
+            $vals = @($Property | ForEach-Object { $v = $it.$_; if ($v -is [array]) { $v -join ', ' } else { "$v" } } | Where-Object { $_ -and $_ -ne 'False' -and $_ -ne 'True' })
+            $rows += @{ Main = $(if ($vals.Count) { $vals[0] } else { "$it" }); Sub = (@($vals | Select-Object -Skip 1) -join '  -  ') }
+            $checked += [bool]($Default -contains $it)
+        }
+        $text = if ($Default.Count) { "$($Default.Count) $What. Untick anything you don't want." } else { "Nothing is needed by default - tick anything you want." }
+        $idx = Show-KitSelect -Title $Title -Text $text -Rows $rows -Checked $checked -OkText 'Continue' -SkipText 'Skip'
+        return @($idx | ForEach-Object { $Items[$_] })
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Locate backup
 # ---------------------------------------------------------------------------
 Clear-Host
-Write-Title 'NEW PC SETUP'
+Write-Title "PC REINSTALL KIT v$AppVersion  -  SET UP THIS PC"
 
 $Script:B = $null
 $Script:M = $null
@@ -385,8 +497,17 @@ if ($cands.Count -gt 1) {
 }
 if (-not $cands) {
     Write-Warn2 'No backup folder (PCBackup_*) found next to this script.'
-    $p = Read-Host '  Type the path to a PCBackup_* folder, or press Enter to continue WITHOUT a backup (generic setup)'
-    if ($p) { $cands = Find-Backup $p.Trim('"', ' ') }
+    if ($Script:Gui) {
+        while (-not $cands) {
+            $c = Show-KitChoice "No backup found next to this program.`nIf your backup is on a USB stick, plug it in and choose it. You can also set up this PC without a backup (general steps only)." @('Choose the backup folder...', 'Continue without a backup') 0
+            if ($c -ne 0) { break }
+            $f = Show-KitFolder 'Choose the PCBackup_... folder (or the drive it is on)'
+            if ($f) { $cands = @(Find-Backup $f); if (-not $cands) { Show-KitInfo "No backup found in $f. Look for a folder named PCBackup_<computer name>_<date>." } }
+        }
+    } else {
+        $p = Read-Host '  Type the path to a PCBackup_* folder, or press Enter to continue WITHOUT a backup (generic setup)'
+        if ($p) { $cands = Find-Backup $p.Trim('"', ' ') }
+    }
 }
 if ($cands) {
     $Script:B = $cands[0].FullName
@@ -561,7 +682,7 @@ function Step-Updates {
     if (Ask-YesNo 'Open Microsoft Store updates too?' $true) { Open-Target 'ms-windows-store://downloadsandupdates' }
     Wait-Enter 'Press Enter when updates are installed (or to continue while they run)'
     if (Ask-YesNo 'Restart now and re-open this setup automatically after sign-in?' $false) {
-        $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        $cmd = "powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
         if ($B) { $cmd += " -BackupPath `"$B`"" }
         New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'PCSetupResume' -Value $cmd -PropertyType String -Force | Out-Null
         Set-Done 'updates'
@@ -686,7 +807,7 @@ function Step-AppsWinget {
         Write-Host ("  [{0}/{1}] Installing {2} ({3})..." -f $n, $sel.Count, $a.Name, $a.Id) -ForegroundColor White
         $wargs = @('install', '--id', $a.Id, '-e', '--accept-package-agreements', '--accept-source-agreements')
         if ($a.Source) { $wargs += @('--source', $a.Source) }
-        & winget.exe @wargs | Out-Host
+        & winget.exe @wargs 2>&1 | Write-KitOutput
         $code = $LASTEXITCODE
         if ($code -eq 0 -or $code -eq -1978335189 -or $code -eq -1978335135) { $ok += $a.Name; Write-Ok $a.Name }
         else { $failed += $a; Write-Fail ("{0} (exit code {1})" -f $a.Name, $code) }
@@ -860,14 +981,19 @@ function Restore-Gecko($bk) {
     }
     $target = Get-GeckoDefaultProfile $root
     if (-not $target) { Write-Fail "Could not find the $($bk.Browser) profile on this PC."; return }
-    Write-Host ''
-    Write-Host "  Restore $($bk.Browser) profile '$($bk.ProfileName)':" -ForegroundColor White
-    Write-Host '    1. Everything (bookmarks, history, passwords, extensions, settings, open tabs)  <- recommended'
-    Write-Host '    2. Bookmarks and history only'
-    Write-Host '    3. Saved passwords only'
-    Write-Host '    4. Skip'
-    $c = Read-Host '  Choose 1-4 (Enter = 1)'
-    if ([string]::IsNullOrWhiteSpace($c)) { $c = '1' }
+    if ($Script:Gui) {
+        $ci = Show-KitChoice "Restore $($bk.Browser) profile '$($bk.ProfileName)'`nWhat should be copied into $($bk.Browser) on this PC?" @('Everything: bookmarks, history, passwords, extensions, settings (recommended)', 'Bookmarks and history only', 'Saved passwords only', 'Skip') 0
+        $c = if ($ci -ge 0) { "$($ci + 1)" } else { '4' }
+    } else {
+        Write-Host ''
+        Write-Host "  Restore $($bk.Browser) profile '$($bk.ProfileName)':" -ForegroundColor White
+        Write-Host '    1. Everything (bookmarks, history, passwords, extensions, settings, open tabs)  <- recommended'
+        Write-Host '    2. Bookmarks and history only'
+        Write-Host '    3. Saved passwords only'
+        Write-Host '    4. Skip'
+        $c = Read-Host '  Choose 1-4 (Enter = 1)'
+        if ([string]::IsNullOrWhiteSpace($c)) { $c = '1' }
+    }
     if ($c -notin '1', '2', '3') { return }
     if (-not (Stop-AppProcess $map.Proc $bk.Browser)) { return }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1195,14 +1321,14 @@ function Step-System {
         foreach ($d in $M.WSL) { Write-Info "Old PC distro: $($d.Name) ($($d.Size))$(if ($d.Exported) { ' - exported' })" }
         & wsl.exe --status 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            if (Ask-YesNo 'WSL is not set up. Install it now (needs a restart)?' $true) { & wsl.exe --install --no-distribution | Out-Host; Write-Todo 'Restart, then run this step again to import distros.' }
+            if (Ask-YesNo 'WSL is not set up. Install it now (needs a restart)?' $true) { & wsl.exe --install --no-distribution 2>&1 | Write-KitOutput; Write-Todo 'Restart, then run this step again to import distros.' }
         } else {
             foreach ($d in @($M.WSL | Where-Object Exported)) {
                 $tar = Join-Path $B $d.Exported
                 if ((Test-Path -LiteralPath $tar) -and (Ask-YesNo "Import WSL distro '$($d.Name)' from the backup?" $true)) {
                     $dir = Join-Path $env:LOCALAPPDATA "WSL\$($d.Name)"
                     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-                    & wsl.exe --import $d.Name $dir $tar | Out-Host
+                    & wsl.exe --import $d.Name $dir $tar 2>&1 | Write-KitOutput
                     if ($LASTEXITCODE -eq 0) { Write-Ok "Imported $($d.Name). (Default user may need: /etc/wsl.conf [user] default=<name>)" }
                 }
             }
@@ -1436,6 +1562,18 @@ function Step-Checklist {
     Write-Title 'Step 11 - Guided checklist'
     $items = @(Get-ChecklistItems)
     if (-not $items) { return $true }
+    if ($Script:Gui) {
+        $rows = @(foreach ($it in $items) { @{ Section = $it.Section; Text = $it.Text; Link = $it.Link; Done = (Test-Done ('chk:' + $it.Text)) } })
+        $done = @(Show-KitChecklist -Items $rows)
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            $key = 'chk:' + $items[$i].Text
+            if ($done -contains $i) { if (-not (Test-Done $key)) { $Script:Progress[$key] = (Get-Date).ToString('s') } }
+            elseif ($Script:Progress.ContainsKey($key)) { $Script:Progress.Remove($key) }
+        }
+        Save-Progress
+        Write-Ok ("Checklist: {0} of {1} done. Open it again any time from step 11." -f $done.Count, $items.Count)
+        return $true
+    }
     $open = @($items | Where-Object { -not (Test-Done ('chk:' + $_.Text)) })
     Write-Info ("{0} items, {1} still open. Keys:  Enter = done   O = open the setting/link   S = skip for now   B = back to menu" -f $items.Count, $open.Count)
     $lastSection = ''
@@ -1508,33 +1646,86 @@ function Step-Finish {
 # Menu
 # ---------------------------------------------------------------------------
 $Steps = @(
-    @{ Id = 'network';    Title = 'Internet and network drivers';        Run = { Step-Network } }
-    @{ Id = 'updates';    Title = 'Windows Update and activation';       Run = { Step-Updates } }
-    @{ Id = 'drivers';    Title = 'Drivers (chipset, GPU, audio...)';    Run = { Step-Drivers } }
-    @{ Id = 'winget';     Title = 'Install apps (automatic, winget)';    Run = { Step-AppsWinget } }
-    @{ Id = 'manual';     Title = 'Apps to install by hand, peripherals, licenses'; Run = { Step-AppsManual } }
-    @{ Id = 'browsers';   Title = 'Browsers: bookmarks, profiles, extensions, passwords'; Run = { Step-Browsers } }
-    @{ Id = 'files';      Title = 'Personal files';                      Run = { Step-Files } }
+    @{ Id = 'network';    Title = 'Internet';        Run = { Step-Network } }
+    @{ Id = 'updates';    Title = 'Windows Update';       Run = { Step-Updates } }
+    @{ Id = 'drivers';    Title = 'Drivers';    Run = { Step-Drivers } }
+    @{ Id = 'winget';     Title = 'Install apps';    Run = { Step-AppsWinget } }
+    @{ Id = 'manual';     Title = 'Other apps and devices'; Run = { Step-AppsManual } }
+    @{ Id = 'browsers';   Title = 'Browsers'; Run = { Step-Browsers } }
+    @{ Id = 'files';      Title = 'Your files';                      Run = { Step-Files } }
     @{ Id = 'settings';   Title = 'Windows settings';                    Run = { Step-Settings } }
-    @{ Id = 'system';     Title = 'System extras (features, fonts, printers, drives...)'; Run = { Step-System } }
-    @{ Id = 'appconfigs'; Title = 'App settings (VS Code, SSH, OBS, signatures...)'; Run = { Step-AppConfigs } }
-    @{ Id = 'checklist';  Title = 'Guided checklist';                    Run = { Step-Checklist } }
-    @{ Id = 'finish';     Title = 'Finish: final checks and clean-up';   Run = { Step-Finish } }
+    @{ Id = 'system';     Title = 'System extras'; Run = { Step-System } }
+    @{ Id = 'appconfigs'; Title = 'App settings'; Run = { Step-AppConfigs } }
+    @{ Id = 'checklist';  Title = 'Checklist';                    Run = { Step-Checklist } }
+    @{ Id = 'finish';     Title = 'Finish';   Run = { Step-Finish } }
 )
 
 function Invoke-SetupStep($s) {
+    $idx = -1
+    for ($i = 0; $i -lt $Steps.Count; $i++) { if ($Steps[$i].Id -eq $s.Id) { $idx = $i; break } }
+    if ($Script:Gui) { Send-KitMessage @{ T = 'step'; Index = $idx; State = 'running' } }
     $ok = $false
     try { $ok = & $s.Run } catch { Write-Fail "$($s.Title): $($_.Exception.Message)"; $ok = $false }
     if ($ok -is [array]) { $ok = $ok[-1] }
     if ($ok) { Set-Done $s.Id }
+    if ($Script:Gui) {
+        Send-KitMessage @{ T = 'progress'; Done = $true }
+        Send-KitMessage @{ T = 'step'; Index = $idx; State = $(if ($ok) { 'done' } else { 'warn' }) }
+    }
     return [bool]$ok
 }
 
 try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'PCSetupResume' -ErrorAction SilentlyContinue } catch { }
 
+if ($Script:Gui) {
+    $Script:KitLogFile = Join-Path $Script:LogDir ("setup-log-{0}.txt" -f $env:COMPUTERNAME)
+    Send-KitMessage @{ T = 'steps'; Titles = @($Steps | ForEach-Object { $_.Title }) }
+    for ($i = 0; $i -lt $Steps.Count; $i++) { if (Test-Done $Steps[$i].Id) { Send-KitMessage @{ T = 'step'; Index = $i; State = 'done' } } }
+    if ($B) {
+        Send-KitMessage @{ T = 'subtitle'; Text = ("Restoring {0} ({1} {2}) - backup from {3}" -f $M.ComputerName, $OldSys.Manufacturer, $OldSys.Model, ($M.Created -replace 'T.*$', '')) }
+        $paths = @{ T = 'paths' }
+        if (Test-Path (Join-Path $B 'report.html')) { $paths.Report = Join-Path $B 'report.html' }
+        if (Test-Path (Join-Path $B 'apps.html')) { $paths.Apps = Join-Path $B 'apps.html' }
+        Send-KitMessage $paths
+        Write-Ok "Backup found: $B"
+        if ($M.ScriptVersion -and $M.ScriptVersion -ne $AppVersion) { Write-Info "Backup was made with version $($M.ScriptVersion); this is version $AppVersion." }
+    } else {
+        Send-KitMessage @{ T = 'subtitle'; Text = 'No backup loaded - general setup steps' }
+        Write-Warn2 'No backup loaded. The steps still work, using this PC and a list of common apps.'
+    }
+    $doneCount = @($Steps | Where-Object { Test-Done $_.Id }).Count
+    Send-KitMessage @{ T = 'status'; Text = $(if ($doneCount -eq 0) { 'Ready to set up this PC' } elseif ($doneCount -lt $Steps.Count) { 'Welcome back - continue where you left off' } else { 'All steps are done' }) }
+    Write-Todo 'Click "Start setup" to go through every step in order. Each step asks before changing anything.'
+    Write-Info 'You can also click a step on the left and choose "Run this step".'
+    Send-KitMessage @{ T = 'ready' }
+    while (-not $KitSync.Closing) {
+        $cmd = $null
+        if (-not $KitSync.Commands.TryDequeue([ref]$cmd)) { Start-Sleep -Milliseconds 150; continue }
+        Send-KitMessage @{ T = 'busy'; Value = $true }
+        try {
+            if ($cmd -eq 'all') {
+                foreach ($st in $Steps) {
+                    if ($KitSync.Closing) { break }
+                    if (Test-Done $st.Id) { continue }
+                    $ok = Invoke-SetupStep $st
+                    if (-not $ok -and $st.Id -ne 'finish') {
+                        if (-not (Ask-YesNo "The step '$($st.Title)' did not finish.`nContinue with the next step? You can come back to it later." $true)) { break }
+                    }
+                }
+            } elseif ($cmd -match '^step:(\d+)$') {
+                [void](Invoke-SetupStep $Steps[[int]$Matches[1]])
+            }
+        } catch { if (-not $KitSync.Closing) { Write-Fail $_.Exception.Message } }
+        $doneCount = @($Steps | Where-Object { Test-Done $_.Id }).Count
+        Send-KitMessage @{ T = 'status'; Text = $(if ($doneCount -eq $Steps.Count) { 'All steps are done - enjoy your PC' } else { "$doneCount of $($Steps.Count) steps done" }) }
+        Send-KitMessage @{ T = 'busy'; Value = $false }
+    }
+    return
+}
+
 while ($true) {
     Clear-Host
-    Write-Title 'NEW PC SETUP'
+    Write-Title "PC REINSTALL KIT v$AppVersion  -  SET UP THIS PC"
     if ($B) {
         Write-Host ("  Backup: {0}" -f $B) -ForegroundColor Gray
         Write-Host ("  From:   {0} ({1} {2}), saved {3}" -f $M.ComputerName, $OldSys.Manufacturer, $OldSys.Model, $M.Created) -ForegroundColor Gray
