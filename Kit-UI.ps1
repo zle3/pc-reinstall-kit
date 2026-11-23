@@ -101,7 +101,9 @@ function Set-KitConsoleVisible([bool]$Visible) {
 function Get-KitPalette {
     # Mauve / slate palette. Follows the Windows app theme (dark unless Windows is set to light).
     $light = $false
+    if ($env:PCKIT_THEME -eq 'light') { $light = $true } elseif ($env:PCKIT_THEME -eq 'dark') { $light = $false } else {
     try { $light = ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name AppsUseLightTheme -ErrorAction Stop).AppsUseLightTheme -eq 1) } catch { }
+    }
     if ($light) {
         return @{ Dark = $false; Bg = '#FFFFFF'; Side = '#F9F9FB'; Card = '#F9F9FB'; Card2 = '#F8F4F6'; Fg = '#2D2D3F'; Muted = '#606086'; Line = '#CDCDDB'
                   Accent = '#84596F'; Btn = '#84596F'; BtnHover = '#6C495B'; BtnFg = '#FFFFFF'; SecHover = '#F8F4F6'; Chip = '#D9C6D0'; ChipFg = '#533846'
@@ -168,6 +170,16 @@ $secondary
   <Setter Property="Background" Value="$($p.Card)"/><Setter Property="Foreground" Value="$($p.Fg)"/><Setter Property="BorderBrush" Value="$($p.Line)"/>
   <Setter Property="CaretBrush" Value="$($p.Fg)"/><Setter Property="Padding" Value="10,7"/><Setter Property="BorderThickness" Value="1"/>
 </Style>
+<Style TargetType="ScrollBar">
+  <Setter Property="Width" Value="10"/><Setter Property="MinWidth" Value="10"/><Setter Property="Background" Value="Transparent"/>
+  <Setter Property="Template"><Setter.Value>
+    <ControlTemplate TargetType="ScrollBar">
+      <Track x:Name="PART_Track" IsDirectionReversed="True" Margin="2,2,2,2">
+        <Track.Thumb><Thumb><Thumb.Template><ControlTemplate TargetType="Thumb"><Border CornerRadius="3" Background="$($p.Line)"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+      </Track>
+    </ControlTemplate>
+  </Setter.Value></Setter>
+</Style>
 <Style TargetType="CheckBox"><Setter Property="Foreground" Value="$($p.Fg)"/><Setter Property="VerticalContentAlignment" Value="Top"/><Setter Property="Cursor" Value="Hand"/></Style>
 <Style TargetType="RadioButton"><Setter Property="Foreground" Value="$($p.Fg)"/><Setter Property="VerticalContentAlignment" Value="Top"/><Setter Property="Cursor" Value="Hand"/></Style>
 </Window.Resources>
@@ -203,13 +215,14 @@ function Set-KitDarkTitleBar($Window) {
 }
 
 function Save-KitSnapshot($Window, [string]$Name) {
-    # Test hook: PCKIT_SNAPSHOT=<folder> saves a PNG of each window.
+    # Test / screenshot hook: PCKIT_SNAPSHOT=<folder> saves a PNG (2x scale) of each window's client area.
     if (-not $env:PCKIT_SNAPSHOT) { return }
     try {
         $Window.UpdateLayout()
-        $w = [int][math]::Max(1, $Window.ActualWidth); $h = [int][math]::Max(1, $Window.ActualHeight)
-        $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($w, $h, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
-        $bmp.Render($Window)
+        $root = [System.Windows.Media.VisualTreeHelper]::GetChild($Window, 0)
+        $w = [int][math]::Max(1, $root.ActualWidth); $h = [int][math]::Max(1, $root.ActualHeight)
+        $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(($w * 2), ($h * 2), 192, 192, [System.Windows.Media.PixelFormats]::Pbgra32)
+        $bmp.Render($root)
         $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
         $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
         $fs = [IO.File]::Create((Join-Path $env:PCKIT_SNAPSHOT ("{0:D2}-{1}.png" -f (++$Script:Kit.SnapNo), $Name)))
@@ -671,6 +684,7 @@ function Invoke-KitTick {
                     if (-not $k.Busy -and $env:PCKIT_AUTOCLOSE -eq '1') { $k.LogScroll.ScrollToEnd(); Save-KitSnapshot $k.Window 'main-idle'; $k.Window.Close() }
                 }
                 'ready'    { $k.Ready = $true; Update-KitButtons }
+                'snap'     { if ($env:PCKIT_SNAPSHOT) { $k.Window.UpdateLayout(); $k.LogScroll.ScrollToEnd(); Save-KitSnapshot $k.Window $msg.Name } }
                 'done'     {
                     $k.Finished = $true; $k.DoneMsg = $true
                     $k.StatusTitle.Text = "$($msg.Text)"
